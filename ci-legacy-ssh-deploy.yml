@@ -1,0 +1,157 @@
+# ci-legacy-ssh-deploy.yml ─ v2.1.0
+# Universal SSH-deployment template: one file for all projects.
+
+###########################################################
+# GLOBAL SETTINGS
+###########################################################
+image: ubuntu:latest
+
+stages:
+  - init
+  - upload
+  - register
+  - checking
+
+# Disable GitLab’s job cache entirely (fresh run every time)
+cache:
+  policy: pull
+  paths: []
+
+###########################################################
+# DEFAULT VARIABLES (projects override in their own CI/CD settings)
+###########################################################
+variables:
+  DEV_BRANCH:  "development"   # branch that triggers the DEV environment
+  PROD_BRANCH: "staging"       # branch that triggers the PROD environment
+
+###########################################################
+# HELPER – establish SSH trust for every host in $SSH_HOSTS
+###########################################################
+.init_ssh: &init_ssh |
+  which ssh-agent || (apt-get update -y && apt-get install openssh-client -y)
+  eval $(ssh-agent -s)
+  echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  for HOST in $SSH_HOSTS; do
+    ssh-keyscan "$HOST" >> ~/.ssh/known_hosts
+  done
+  chmod 644 ~/.ssh/known_hosts
+  [[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n" > ~/.ssh/config
+
+###########################################################
+# GENERIC JOB TEMPLATES
+###########################################################
+.remote-init:
+  stage: init
+  before_script: [*init_ssh]
+  script: |
+    for HOST in $SSH_HOSTS; do
+      echo "INIT      — $HOST"
+      ssh "$SSH_USER@$HOST" "powershell \
+        if (-not (Test-Path $BASE_PATH\\$APP_FOLDER)) { \
+          New-Item -ItemType Directory -Path $BASE_PATH\\$APP_FOLDER ; \
+          Write-Host 'Folder created' \
+        } else { Write-Host 'Folder exists' }"
+    done
+
+.remote-upload:
+  stage: upload
+  before_script: [*init_ssh]
+  script: |
+    for HOST in $SSH_HOSTS; do
+      echo "UPLOAD    — $HOST"
+      scp -r ${CI_PROJECT_DIR}/ "$SSH_USER@$HOST":"$BASE_PATH\\$APP_FOLDER"
+    done
+
+.remote-register:
+  stage: register
+  before_script: [*init_ssh]
+  script: |
+    for HOST in $SSH_HOSTS; do
+      echo "REGISTER  — $HOST"
+      # Build the full path using CI_PROJECT_NAME
+      FULL_PATH="${BASE_PATH}\\${APP_FOLDER}\\${CI_PROJECT_NAME}"
+      ssh "$SSH_USER@$HOST" "powershell \
+        if (Test-Path '$FULL_PATH') { \
+          if (Get-Website -Name $IIS_WEBSITE_NAME) { \
+            Write-Host 'Site already present at' '$FULL_PATH' \
+          } else { \
+            Write-Host 'Registering site at' '$FULL_PATH' ; \
+            New-WebSite -Name $IIS_WEBSITE_NAME \
+              -PhysicalPath '$FULL_PATH' \
+              -ApplicationPool 'Classic .NET AppPool' \
+              -Port $IIS_PORT \
+          } \
+        } else { \
+          Write-Host 'ERROR: Path does not exist:' '$FULL_PATH' ; exit 1 \
+        }"
+    done
+
+.remote-check:
+  stage: checking
+  before_script: [*init_ssh]
+  script: |
+    for HOST in $SSH_HOSTS; do
+      echo "CHECK     — $HOST"
+      ssh "$SSH_USER@$HOST" "powershell \
+        ls $BASE_PATH\\ ; ls $BASE_PATH\\$APP_FOLDER"
+    done
+
+###########################################################
+# RULE ANCHORS (use variables for branch names)
+###########################################################
+.dev-rules: &dev-rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $DEV_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $DEV_BRANCH'
+
+.prod-rules: &prod-rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $PROD_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $PROD_BRANCH'
+
+###########################################################
+# DEV JOB SUITE (uses $SSH_HOSTS_DEV)
+###########################################################
+dev-init:
+  extends: .remote-init
+  variables: { SSH_HOSTS: "$SSH_HOSTS_DEV" }
+  <<: *dev-rules
+
+dev-upload:
+  extends: .remote-upload
+  variables: { SSH_HOSTS: "$SSH_HOSTS_DEV" }
+  <<: *dev-rules
+
+dev-register:
+  extends: .remote-register
+  variables: { SSH_HOSTS: "$SSH_HOSTS_DEV" }
+  <<: *dev-rules
+
+dev-check:
+  extends: .remote-check
+  variables: { SSH_HOSTS: "$SSH_HOSTS_DEV" }
+  <<: *dev-rules
+
+###########################################################
+# PROD JOB SUITE (uses $SSH_HOSTS_PROD)
+###########################################################
+prod-init:
+  extends: .remote-init
+  variables: { SSH_HOSTS: "$SSH_HOSTS_PROD" }
+  <<: *prod-rules
+
+prod-upload:
+  extends: .remote-upload
+  variables: { SSH_HOSTS: "$SSH_HOSTS_PROD" }
+  <<: *prod-rules
+
+prod-register:
+  extends: .remote-register
+  variables: { SSH_HOSTS: "$SSH_HOSTS_PROD" }
+  <<: *prod-rules
+
+prod-check:
+  extends: .remote-check
+  variables: { SSH_HOSTS: "$SSH_HOSTS_PROD" }
+  <<: *prod-rules
